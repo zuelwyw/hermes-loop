@@ -1,4 +1,4 @@
-/* dsh-plugin-hermes-loop — browser half (hand-rolled loader bundle, no build step).
+/* @zuelwyw/hermes-loop — browser half (hand-rolled loader bundle, no build step).
  *
  * One tab in the conversation view ring ("Hermes Loop"), next to 对话/轨迹/上下文.
  * Data comes exclusively from the host half's /hermes-loop/api/* routes — the
@@ -7,7 +7,7 @@
  * (render through the slot tree). Colors ride the --dsw-* theme tokens.
  */
 window.__ModuleLoader__.load({
-  id: '@weibaohui/hermes-loop',
+  id: '@zuelwyw/hermes-loop',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -1541,7 +1541,7 @@ window.__ModuleLoader__.load({
     }
 
     module.exports = {
-      name: '@weibaohui/hermes-loop',
+      name: '@zuelwyw/hermes-loop',
       inject: ['slots', 'locale'],
       apply: function (ctx) {
         var NS = 'hermes-loop'

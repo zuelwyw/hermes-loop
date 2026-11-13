@@ -1,11 +1,14 @@
-# @weibaohui/hermes-loop
+# @zuelwyw/hermes-loop
 
 [![DSH plugin](https://img.shields.io/badge/dsh-plugin-green)](https://github.com/topics/dsh-plugin)
-[![npm version](https://img.shields.io/npm/v/@weibaohui/hermes-loop)](https://www.npmjs.com/package/@weibaohui/hermes-loop)
+[![GitHub fork](https://img.shields.io/badge/fork-zuelwyw%2Fhermes--loop-green)](https://github.com/zuelwyw/hermes-loop)
+
+> 本仓库是 [weibaohui/hermes-loop](https://github.com/weibaohui/hermes-loop) 的 fork，包名改为 `@zuelwyw/hermes-loop`。
+> 运行时标识刻意保持不变：数据目录 `~/.dsh/hermes-loop/`、设置命名空间 `hermes-loop`、HTTP 路由 `/hermes-loop/api`，因此升级不影响既有待审候选与已保存设置。
 
 **自动复盘插件**：对话收尾后自动复盘，把有价值的经验蒸馏成可复用的技能（skill），把值得长期记住的事实与偏好写入跨会话记忆。
 
-![Hermes Loop：会话内复盘面板与技能治理](https://cdn.jsdelivr.net/gh/weibaohui/hermes-loop@main/docs/demo.gif)
+![Hermes Loop：会话内复盘面板与技能治理](docs/demo.gif)
 
 ## 核心功能
 
@@ -21,7 +24,7 @@
 ## 安装
 
 ```bash
-dsh plugin --profile web add @weibaohui/hermes-loop -w
+dsh plugin --profile web add @zuelwyw/hermes-loop -w
 ```
 
 装完重启 `dsh web` 即生效。
