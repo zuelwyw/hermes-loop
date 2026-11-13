@@ -35,6 +35,16 @@ dsh plugin --profile web add @weibaohui/hermes-loop -w
 5. 沉淀记录、使用统计与 Curator 表里的技能名后都有「查看」按钮，弹窗直接看 SKILL.md 内容（Markdown 渲染；项目级技能也能看）
 6. 记忆条目在面板查看用量与内容；增删改直接编辑 `~/.dsh/memory/MEMORY.md` / `USER.md`（全局层）或 `~/.dsh/memory/workspaces/<工作区>/MEMORY.md`（工作区层），一行一条、`§ ` 开头，下个会话生效
 
+## 审批模式：候选来源与「提出修改要求」
+
+`mode: approval` 下，复盘结论暂存到 `~/.dsh/hermes-loop/pending/`，在面板的「待审批」卡片里逐条处理。
+
+- **审批面只做查看与通过/拒绝**，不提供候选正文编辑——与 Hermes 官方一致：改内容由模型做，人只做取舍。
+- **通过/拒绝按通道独立**：技能与记忆分开结算，混合候选可以只处理一半，其余保持待审。
+- **幂等**：`operationId` 绑定决定指纹，重复提交返回既有结果；写盘前落哈希意图，崩溃后按哈希核对而不是盲目重放。
+- **「提出修改要求」**：输入要求后启动一次聚焦复盘，要求作为 prompt 文本进入模型；产出的**新**候选带 `revisionOf` 指回原候选，原候选保持待审直到你明确处理。要求需要来源会话在本进程内仍存活，否则如实报 `ESESSIONGONE`，不会假装已送达。
+- **来源显示**：只有暂存时确实记下的来源才显示；curator 产生的候选标「来源未知」，不用同名技能的历史记录去推断。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -45,7 +55,8 @@ dsh plugin --profile web add @weibaohui/hermes-loop -w
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
-| 0.1.17 | 0.2.0-rc.2 | 当前版本；复盘 prompt / 记忆快照 / 收尾沉淀段跟随 DSH 语言设置（`locale.preference`），不重启切换即生效；e2e 测试清理竞态修复 |
+| 0.4.0 | 0.2.2-rc.3 | 本分支：审批收件箱（分通道结算 / 幂等 / 崩溃核对）、定向复盘式「提出修改要求」；修复工作区 slug 碰撞、设置覆盖层永久遮蔽、归档恢复假成功、转写限额两个死开关；包版本号此前未随 0.3.x 递增，本版对齐至 0.4.0 |
+| 0.1.17 | 0.2.0-rc.2 | 复盘 prompt / 记忆快照 / 收尾沉淀段跟随 DSH 语言设置（`locale.preference`），不重启切换即生效；e2e 测试清理竞态修复 |
 | 0.1.16 | 0.1.7-rc.2 | 修复降级路径 Config 导出 null——宿主 settings schema() 不排除 null，会炸 settings.describe() 拖垮整份设置文档（同 dsh-continue#4） |
 | 0.1.13 | 0.1.7-rc.2 | 修复宿主将 volatile 字段物化为 {} 导致的设置毒化（saneConfigValues 清洗 + 移除 Config 兼容字符串字段） |
 | 0.1.12 | 0.1.7-rc.2 | 适配 0.1.7 settings 模型（导出 volatile `Config`，`ctx.settings.update` 持久化），面板改动重启不再丢失 |

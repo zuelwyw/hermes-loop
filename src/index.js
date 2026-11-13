@@ -17,6 +17,7 @@
  */
 
 const { createHash, randomUUID } = require('node:crypto')
+const { createApproval } = require('./approval')
 const fsP = require('node:fs/promises')
 const fs = require('node:fs')
 const { join, resolve, sep } = require('node:path')
@@ -42,6 +43,9 @@ let schemaRequireError = null
 let Schema = loadSchemastery()
 
 const KEbab_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+// A revision requirement becomes prompt text: cap it so one request cannot
+// inflate the review prompt without bound.
+const IMPROVE_MAX_CHARS = 4000
 const DESCRIPTION_MAX = 500
 
 // ── Locale-aware copy ─────────────────────────────────────────────────────
@@ -278,16 +282,91 @@ function memoryDir() {
 // 宿主在会话创建时校验必须为绝对路径）。slug 参考 Claude Code：路径分隔符与
 // 盘符冒号逐字折成 '-'，如 /Users/mac/proj → -Users-mac-proj。
 const WORKSPACE_SLUG_MAX = 128
+/**
+ * Derive a stable, collision-free directory name for a workspace cwd.
+ *
+ * The readable prefix keeps the panel and a human at the shell able to tell
+ * two stores apart; the hash suffix is what actually makes the mapping
+ * injective. `/work/a-b` and `/work/a/b` used to collapse onto the same slug
+ * because the separator was rewritten to `-`, so two projects shared one
+ * MEMORY.md and one character budget.
+ */
 function workspaceSlug(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return undefined
+  const readable = cwd.replace(/[/\\:]/g, '-')
+  const digest = sha256(cwd).slice(0, 12)
+  const keep = Math.max(16, WORKSPACE_SLUG_MAX - digest.length - 1)
+  return `${readable.slice(0, keep)}-${digest}`
+}
+
+/**
+ * The pre-hash slug scheme, kept only so an existing store can be found and
+ * migrated deliberately rather than silently orphaned.
+ */
+function legacyWorkspaceSlug(cwd) {
   if (typeof cwd !== 'string' || cwd.trim() === '') return undefined
   const slug = cwd.replace(/[/\\:]/g, '-')
   if (slug.length <= WORKSPACE_SLUG_MAX) return slug
-  // 超长路径截断并接哈希防碰撞（sha256 定义在下方 helper 区，运行时已就位）
   return slug.slice(0, WORKSPACE_SLUG_MAX - 9) + '-' + sha256(cwd).slice(0, 8)
 }
 function workspaceMemoryDir(cwd) {
   const slug = workspaceSlug(cwd)
   return slug === undefined ? undefined : join(memoryDir(), 'workspaces', slug)
+}
+
+/**
+ * Where a workspace's memory actually lives, honouring a store written by the
+ * pre-hash slug scheme.
+ *
+ * The old scheme was not injective, so a legacy directory is only adopted when
+ * its `<!-- cwd: ... -->` header names exactly this workspace; anything else
+ * stays untouched for a human to sort out. An adopted store is renamed into
+ * place once, so the next write lands on the unambiguous path.
+ */
+function resolveWorkspaceMemoryDir(cwd) {
+  const target = workspaceMemoryDir(cwd)
+  if (target === undefined) return undefined
+  const legacySlug = legacyWorkspaceSlug(cwd)
+  const legacy = legacySlug === undefined || legacySlug === workspaceSlug(cwd)
+    ? undefined
+    : join(memoryDir(), 'workspaces', legacySlug)
+  return { dir: target, legacy }
+}
+
+/**
+ * Read-side resolver: prefer the current (injective) store, fall back to a
+ * legacy store so an existing workspace memory stays visible until the write
+ * path adopts it. Read-only — migration belongs to the write path.
+ */
+function workspaceMemoryReadDir(cwd) {
+  const resolved = resolveWorkspaceMemoryDir(cwd)
+  if (resolved === undefined) return undefined
+  const { dir, legacy } = resolved
+  try { if (fs.statSync(join(dir, 'MEMORY.md')).isFile()) return dir } catch { /* not migrated yet */ }
+  if (legacy !== undefined) {
+    try { if (fs.statSync(join(legacy, 'MEMORY.md')).isFile()) return legacy } catch { /* nothing either */ }
+  }
+  return dir
+}
+
+async function adoptLegacyWorkspaceStore(cwd) {
+  const resolved = resolveWorkspaceMemoryDir(cwd)
+  if (resolved === undefined) return { dir: undefined, adopted: false }
+  const { dir, legacy } = resolved
+  if (legacy === undefined) return { dir, adopted: false }
+  let legacyRaw
+  try { legacyRaw = await fsP.readFile(join(legacy, 'MEMORY.md'), 'utf8') } catch { return { dir, adopted: false } }
+  // Only a store whose own header names this cwd may be adopted: it is the one
+  // piece of evidence that survives the lossy legacy slug.
+  if (workspaceCwdOf(legacyRaw) !== cwd) return { dir, adopted: false, legacy }
+  try {
+    await fsP.access(dir)
+    return { dir, adopted: false, legacy, note: 'both-exist' }
+  } catch { /* target absent: migrate */ }
+  await fsP.mkdir(dir, { recursive: true })
+  await fsP.rename(join(legacy, 'MEMORY.md'), join(dir, 'MEMORY.md'))
+  try { await fsP.rmdir(legacy) } catch {}
+  return { dir, adopted: true, from: legacy }
 }
 // slug 不可逆（路径里的 '-' 与分隔符都折成 '-'），工作区文件标题下写一行
 // cwd 注释自描述——§ 解析天然忽略它，面板与人工编辑都能读到真实路径。
@@ -952,6 +1031,48 @@ const REVIEW_LANGUAGE_DIRECTIVE = {
   zh: '所有自然语言字段（description、body、memory.text、rationale）一律用中文写。这由用户的语言设置决定，与转写、技能目录或记忆条目本身用什么语言无关。',
   en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.',
 }
+/**
+ * Instruction appended when the user asks for a change to an already-staged
+ * candidate. The candidate is NOT edited in place: the reviewer's requirement
+ * is fed into a focused review of the source session, whose conclusion becomes
+ * a new staged candidate. That keeps "improve" a model action, as upstream
+ * Hermes does, and leaves the original candidate for a human to accept/discard.
+ */
+const REVISION_DIRECTIVE = {
+  zh: (req) => [
+    '',
+    '## 本轮是定向修订（用户对一条待审候选提出了修改要求）',
+    '用户要求改动的对象是下面这份待审候选。请以它为基础产出一个新的完整结论；',
+    '不要重复产出与它逐字相同的内容——那样等于没有修订。',
+    '若用户的意见指向既有技能，用 patch 并带上正确的 baseHash；',
+    '若是新技能，用 create 并给出完整的 body 与 description。',
+    '',
+    '### 待审候选当前内容',
+    '```markdown',
+    req.candidateBody || '(空)',
+    '```',
+    '',
+    '### 用户的修改要求',
+    req.instruction,
+  ].join('\n'),
+  en: (req) => [
+    '',
+    '## This round is a targeted revision (the user asked to change a staged candidate)',
+    'Produce a NEW complete conclusion based on the candidate below.',
+    'Do not emit content identical to it — that is not a revision.',
+    'If the request targets an existing skill, use patch with the correct baseHash;',
+    'for a new skill, use create with a complete body and description.',
+    '',
+    '### Current candidate content',
+    '```markdown',
+    req.candidateBody || '(empty)',
+    '```',
+    '',
+    '### The user\'s requested change',
+    req.instruction,
+  ].join('\n'),
+}
+
 const REVIEW_PROMPT_TEXT = {
   zh: (memoryOn) => [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
@@ -1161,11 +1282,13 @@ module.exports = {
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
     parseMemoryEntries, serializeMemoryEntries, scanMemoryEntry, planMemoryChange,
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
-    workspaceSlug, workspaceMemoryDir, workspaceCwdHeader, workspaceCwdOf, scopeCwd,
+    workspaceSlug, legacyWorkspaceSlug, workspaceMemoryDir, workspaceMemoryReadDir,
+    resolveWorkspaceMemoryDir, adoptLegacyWorkspaceStore,
+    workspaceCwdHeader, workspaceCwdOf, scopeCwd,
     // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
     LANGUAGE_RETRIES, createLanguageResolver, countLabel,
-    REVIEW_PROMPT_TEXT, REVIEW_LANGUAGE_DIRECTIVE,
+    REVIEW_PROMPT_TEXT, REVIEW_LANGUAGE_DIRECTIVE, REVISION_DIRECTIVE, IMPROVE_MAX_CHARS,
     MEMORY_CONTEXT_TEXT, LOOP_AWARE_TEXT, REVIEW_INPUT_TEXT, REVIEW_MEMORY_BLOCK_TEXT,
   },
 
@@ -1231,7 +1354,13 @@ module.exports = {
             if (ns === LOCALE_SETTINGS_NS) language.invalidate()
             if (ns !== SETTINGS_NS) return
             const d = readDescriptor()
-            if (d && d.value && typeof d.value === 'object') liveSettings = d.value
+            if (d && d.value && typeof d.value === 'object') {
+              liveSettings = d.value
+              // The durable document is now authoritative: drop any provisional
+              // override left by a failed persist so an edit made from the host
+              // settings page actually takes effect.
+              memoryPatch = {}
+            }
           })
           return () => { try { off() } catch {} }
         }, 'hermes-loop: settings watch')
@@ -1286,7 +1415,7 @@ module.exports = {
           if (cwd !== undefined && eff.memoryEnabled !== false) {
             let raw = ''
             try {
-              const dir = workspaceMemoryDir(cwd)
+              const dir = workspaceMemoryReadDir(cwd)
               if (dir !== undefined) raw = fs.readFileSync(join(dir, 'MEMORY.md'), 'utf8')
             } catch { raw = '' }
             workspace = { label: cwd, raw }
@@ -1395,6 +1524,35 @@ module.exports = {
       trace('curator-managed', { skill: name })
     }
 
+    /**
+     * Stage a governance action (curator archive) as a review candidate so
+     * approval mode covers automatic file mutation, not just review output.
+     */
+    const stageGovernance = async (governance) => {
+      try {
+        const dir = pendingDir()
+        const id = `${Date.now().toString(36)}-governance-${governance.skill}`
+        const payload = {
+          id,
+          at: new Date().toISOString(),
+          sourceSession: 'curator',
+          mode: effective().mode,
+          globalDir: globalSkillsDir(),
+          memoryDir: memoryDir(),
+          cwd: undefined,
+          governance,
+          conclusion: { action: 'nothing', rationale: `Curator 建议归档「${governance.skill}」（${governance.from || 'active'}）` },
+        }
+        await fsP.mkdir(dir, { recursive: true })
+        await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
+        trace('staged', { id, dir, sessionId: 'curator', skill: governance.skill, action: 'governance' })
+        return true
+      } catch (error) {
+        ctx.logger.warn(`hermes-loop: failed to stage governance candidate: ${error && error.message}`)
+        return false
+      }
+    }
+
     const curatorCounts = () => {
       const counts = { active: 0, stale: 0, archived: 0 }
       for (const rec of curatorSkills.values()) {
@@ -1412,6 +1570,9 @@ module.exports = {
       await usageLoaded
       const eff = effective()
       if (!eff.curatorEnabled) return { skipped: 'disabled' }
+      // 总开关与"不写入"档位同样管辖巡检：否则用户关掉插件或选"仅记录/待审批"，
+      // 技能文件仍会被静默重写（归档会翻转模型可见性）。
+      if (!eff.enabled && !manual) return { skipped: 'loop-disabled' }
       if (!manual) {
         if (curatorMeta.lastRunAt === undefined) {
           // 首次运行：播种 lastRunAt，等满一个 interval（curator.py should_run_now 同款纪律）
@@ -1443,7 +1604,23 @@ module.exports = {
             let content
             try { content = await fsP.readFile(file, 'utf8') }
             catch { curatorSkills.delete(t.skill); applied.push({ ...t, note: 'file-missing-dropped' }); continue }
-            await atomicWrite(file, setModelInvocation(content, false))
+            // "仅记录"不写盘；"待审批"把归档变成一条独立的治理候选由人确认，
+            // 而不是绕过用户选择的写入门槛。
+            if (eff.mode === 'log-only') {
+              applied.push({ ...t, note: 'log-only-not-written' })
+              continue
+            }
+            if (eff.mode === 'approval') {
+              const staged = await stageGovernance({ action: 'archive', skill: t.skill, from: curState })
+              applied.push({ ...t, note: staged ? 'staged-for-approval' : 'stage-failed' })
+              continue
+            }
+            const next = setModelInvocation(content, false)
+            if (next === content) {
+              applied.push({ ...t, note: 'frontmatter-unparsable-skipped' })
+              continue
+            }
+            await atomicWrite(file, next)
           }
           rec.state = t.to
           applied.push(t)
@@ -1460,23 +1637,34 @@ module.exports = {
       return { at: curatorMeta.lastRunAt, checked: curatorSkills.size, transitions: applied, counts, summary: curatorMeta.lastSummary }
     }
 
-    /** 归档恢复：移除治理键 + state 回 active；lastRestoredAt 把 anchor 提到恢复时刻（防下轮立即再归档）。 */
+    /**
+     * 归档恢复：移除治理键 + state 回 active；lastRestoredAt 把 anchor 提到恢复时刻（防下轮立即再归档）。
+     * 文件没真正改回来就不能报成功——记录与磁盘必须一致，否则用户点开面板看到 active、
+     * 模型侧却仍读不到该技能，且状态机不会再给第二次机会。
+     */
     const restoreManaged = async (name) => {
       await usageLoaded // 加载窗口内的恢复会被迟到的磁盘旧值盖回——等加载完成
       const rec = curatorSkills.get(name)
       if (rec === undefined) return { status: 404, message: `'${name}' is not managed by hermes-loop` }
       if (rec.state !== 'archived') return { status: 400, message: `'${name}' is not archived (state=${rec.state})` }
-      let note
+      const file = join(globalSkillsDir(), name, 'SKILL.md')
+      let restored
       try {
-        const file = join(globalSkillsDir(), name, 'SKILL.md')
-        await atomicWrite(file, setModelInvocation(await fsP.readFile(file, 'utf8'), true))
-      } catch { note = 'file missing; record restored only' }
+        const current = await fsP.readFile(file, 'utf8')
+        restored = setModelInvocation(current, true)
+        if (restored === current) {
+          return { status: 409, message: `'${name}' frontmatter is unparsable; the governance key could not be removed` }
+        }
+        await atomicWrite(file, restored)
+      } catch (error) {
+        return { status: 500, message: `failed to restore '${name}': ${String(error && error.message || error)}` }
+      }
       rec.state = 'active'
       rec.lastRestoredAt = new Date().toISOString()
       try { await flushUsage() } catch {}
       refreshInvocable() // 恢复会移除治理键——后台刷 modelInvocable 缓存，状态列尽快对上
-      trace('curator-restore', { skill: name, note })
-      return { ok: true, note }
+      trace('curator-restore', { skill: name })
+      return { ok: true, path: file }
     }
 
     // 惰性触发主路径（§10.2）：状态加载完成后补一轮停机期间到期的转移；
@@ -1548,7 +1736,11 @@ module.exports = {
       task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
     }
 
-    const runReview = async ({ session, eff, manual = false }) => {
+    // Set only for the duration of a revision run, so dispatchConclusion can stamp
+    // the new candidate with the link without threading a parameter through it.
+    let activeRevision = null
+
+    const runReview = async ({ session, eff, manual = false, revision = undefined }) => {
       const sessionId = session.id
       const controller = new AbortController()
       const st = stateFor(sessionId)
@@ -1562,7 +1754,14 @@ module.exports = {
       st.lastReviewAt = Date.now()
       running = { sessionId, controller }
       runningSince = new Date().toISOString()
-      trace('review-start', { sessionId, manual, signal: firedSignal && firedSignal.kind, signalDetail: firedSignal && firedSignal.detail })
+      activeRevision = revision !== undefined
+        ? { candidateId: revision.candidateId, instruction: revision.instruction }
+        : null
+      trace('review-start', {
+        sessionId, manual, signal: firedSignal && firedSignal.kind, signalDetail: firedSignal && firedSignal.detail,
+        revisionOf: revision !== undefined ? revision.candidateId : undefined,
+        revisionChars: revision !== undefined ? String(revision.instruction || '').length : undefined,
+      })
 
       let handle
       try {
@@ -1572,7 +1771,11 @@ module.exports = {
         const lang = language()
         // 1. transcript tail
         const messages = session.deriveMessages()
-        const transcriptText = renderTranscript(messages, { ...eff, lang })
+        const transcriptText = renderTranscript(messages, {
+          maxChars: eff.maxTranscriptChars,
+          maxMessages: eff.maxTranscriptMessages,
+          lang,
+        })
 
         // 2. catalog + suspects full text（patch 可行性的前提，§4 输入 3）
         const cwd = session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
@@ -1643,7 +1846,7 @@ module.exports = {
             // 工作区层（§13）：紧跟全局 MEMORY 块之后，空库也注入（让模型知道这层存在，
             // scope:"project" 的结论才有落点）；cwd 缺席/非法时不出现
             if (store === 'memory') {
-              const dir = workspaceMemoryDir(cwd)
+              const dir = workspaceMemoryReadDir(cwd)
               if (dir !== undefined) {
                 let wRaw = ''
                 try { wRaw = await fsP.readFile(join(dir, 'MEMORY.md'), 'utf8') } catch { /* 新库 */ }
@@ -1693,6 +1896,7 @@ module.exports = {
           const IT = REVIEW_INPUT_TEXT[lang]
           const prompt = [
             reviewPrompt(eff, lang),
+            revision !== undefined ? REVISION_DIRECTIVE[lang](revision) : '',
             '\n## ' + IT.catalog + '\n' + catalogText,
             suspectBlocks.length > 0 ? '\n## ' + IT.suspects + '\n' + suspectBlocks.join('\n\n---\n\n') : '',
             memoryBlock,
@@ -1742,6 +1946,9 @@ module.exports = {
       } finally {
         running = null
         runningSince = null
+        // Clear the link before the next queued run starts, so a following
+        // ordinary review cannot inherit this candidate's revision stamp.
+        activeRevision = null
         if (handle) { try { await handle.dispose() } catch {} }
         drainNext()
       }
@@ -1793,10 +2000,20 @@ module.exports = {
         const label = hasSkill ? conclusion.skill : `memory-${conclusion.memory.store}`
         const id = `${Date.now().toString(36)}-${label}`
         // memoryDir 记实际目标目录（工作区库或全局库），cwd 供人工审批时核对归属
-        const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), memoryDir: wsDir || memoryDir(), cwd: sessionCwd, conclusion }
+        const payload = {
+          id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode,
+          globalDir: globalSkillsDir(), memoryDir: wsDir || memoryDir(), cwd: sessionCwd, conclusion,
+          // A candidate produced by a targeted revision names the candidate it
+          // revises. This is recorded at staging time — the only point where the
+          // link is actually known — so the inbox can show it without guessing
+          // from a same-named skill's earlier history.
+          revisionOf: activeRevision !== null ? activeRevision.candidateId : undefined,
+        }
         await fsP.mkdir(dir, { recursive: true })
         await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
-        trace('staged', { id, dir, sessionId })
+        // The ledger row is what the panel lists; without skill/action it renders
+        // an empty name and its "view" button calls the skill reader with nothing.
+        trace('staged', { id, dir, sessionId, skill: hasSkill ? conclusion.skill : undefined, action: conclusion.action, memory: hasMemory ? `${conclusion.memory.store}:${conclusion.memory.action}` : undefined })
         notifySourceSession(session, `后台复盘产出「${label}」已暂存待确认（mode=approval）：${(hasSkill ? conclusion.rationale : conclusion.memory.rationale) || conclusion.action}`)
         ctx.logger.info(`${logHead} — staged to ${dir} for approval`)
         return
@@ -1819,6 +2036,11 @@ module.exports = {
       // ── auto：memory 通道（§12.4）──
       if (hasMemory) {
         const mem = conclusion.memory
+        // A pre-hash workspace store is adopted before the first write so the
+        // slug change cannot split one project's memory across two files.
+        if (wsDir !== undefined) {
+          try { await adoptLegacyWorkspaceStore(sessionCwd) } catch {}
+        }
         const outcome = await applyMemoryConclusion(mem, {
           dir: wsDir || memoryDir(),
           limits: { memory: eff.memoryCharLimit, user: eff.userCharLimit },
@@ -2022,19 +2244,174 @@ module.exports = {
       res.end(JSON.stringify(payload))
     }
     const readJsonBody = (req) => new Promise((fulfil, reject) => {
+      const MAX = 64 * 1024
       let size = 0
+      let tooLarge = false
       const chunks = []
       req.on('data', (chunk) => {
         size += chunk.length
-        if (size > 64 * 1024) { reject(new Error('request body too large')); req.destroy(); return }
+        if (size > MAX) {
+          // Answer with an error instead of tearing the socket down: destroying
+          // here makes the caller see a transport failure, which is
+          // indistinguishable from a dropped connection and invites a retry of a
+          // request that was already refused.
+          tooLarge = true
+          chunks.length = 0
+          req.resume()
+          return
+        }
         chunks.push(chunk)
       })
       req.on('end', () => {
+        if (tooLarge) {
+          const error = new Error(`request body exceeds ${MAX} bytes`)
+          error.code = 'ETOOLARGE'
+          reject(error)
+          return
+        }
         try { fulfil(chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
-        catch (error) { reject(new Error(`invalid JSON body: ${error && error.message}`)) }
+        catch (error) {
+          const invalid = new Error(`invalid JSON body: ${error && error.message}`)
+          invalid.code = 'EBADJSON'
+          reject(invalid)
+        }
       })
       req.on('error', reject)
     })
+    // ── Review inbox (approval mode) ────────────────────────────────────
+    // Approval mode stages candidates and returns; without a consumer they pile
+    // up forever. This service is that consumer: it reads pending/, records
+    // decisions beside them, and reuses the existing writers for the actual
+    // disk mutation so approval never reimplements skill or memory semantics.
+    const approval = createApproval({
+      root: () => join(dshHome(), 'hermes-loop'),
+      pendingDir,
+      globalSkillsDir,
+      memoryDir,
+      workspaceMemoryDir,
+      workspaceCwdHeader,
+      effective,
+      trace,
+      applyConclusion,
+      applyMemoryConclusion,
+      planMemoryChange,
+      parseMemoryEntries,
+      serializeMemoryEntries,
+      sha256,
+      buildSkillMd,
+      mergeFrontmatter,
+      descriptionOf,
+      setModelInvocation,
+      scanMemoryEntry,
+      registerManaged,
+      KEbab_NAME_RE,
+      atomicWrite,
+      limits: { body: BODY_MAX_CHARS, description: DESCRIPTION_MAX, memoryEntry: MEMORY_ENTRY_MAX_CHARS },
+      adoptWorkspaceStore: adoptLegacyWorkspaceStore,
+      notifySourceSession: (sessionId, text) => {
+        try {
+          if (typeof ctx.sessions.get !== 'function') return
+          const session = ctx.sessions.get(sessionId)
+          if (session !== undefined) notifySourceSession(session, text)
+        } catch { /* the source session is often gone; the ledger keeps the record */ }
+      },
+      logger: ctx.logger,
+    })
+    approval.recover()
+      .then((r) => { if (r.checked > 0) trace('approval-recovered', r) })
+      .catch((e) => ctx.logger.warn(`hermes-loop: approval recovery: ${e && e.message}`))
+
+    /**
+     * Ask the model to revise a staged candidate.
+     *
+     * Nothing here edits the candidate. The requirement goes into a focused
+     * review of the candidate's source session; whatever the model concludes is
+     * staged as a NEW candidate that records `revisionOf`. The original stays in
+     * the inbox until a human approves or rejects it.
+     */
+    const requestImprovement = async (body) => {
+      const id = body && body.id
+      if (!approval.isSafeId(id)) {
+        return { status: 400, payload: { error: 'invalid candidate id', code: 'EINVALID' } }
+      }
+      const instruction = body && typeof body.instruction === 'string' ? body.instruction.trim() : ''
+      if (instruction === '') {
+        return { status: 400, payload: { error: 'body must provide a non-empty instruction', code: 'EINVALID' } }
+      }
+      if (instruction.length > IMPROVE_MAX_CHARS) {
+        return { status: 413, payload: { error: `instruction exceeds ${IMPROVE_MAX_CHARS} characters`, code: 'ETOOLARGE' } }
+      }
+
+      let candidate
+      try { candidate = await approval.detail(id) } catch (error) {
+        const status = { EINVALID: 400, ENOTFOUND: 404, ECORRUPT: 422, ENOCWD: 409 }[error && error.code] || 500
+        return { status, payload: { error: String(error && error.message || error), code: error && error.code } }
+      }
+
+      // The review needs a live session to snapshot. Report that plainly instead
+      // of pretending the requirement was delivered somewhere.
+      const sourceSessionId = candidate.sourceSession
+      if (typeof sourceSessionId !== 'string' || sourceSessionId === '' || sourceSessionId === 'curator') {
+        return {
+          status: 409,
+          payload: {
+            error: 'this candidate has no source conversation to revise from; edit the requirement in a new conversation instead',
+            code: 'ENOSOURCE',
+          },
+        }
+      }
+      if (typeof ctx.sessions.get !== 'function') {
+        return { status: 503, payload: { error: 'sessions service unavailable', code: 'EUNVAILABLE' } }
+      }
+      const session = ctx.sessions.get(sourceSessionId)
+      if (session === undefined) {
+        return {
+          status: 409,
+          payload: {
+            error: `source session '${sourceSessionId}' is not live in this process; open that conversation and ask for the change there`,
+            code: 'ESESSIONGONE',
+          },
+        }
+      }
+      if (sourceSessionId.startsWith('hermes-loop-review-')) {
+        return { status: 400, payload: { error: 'cannot revise from a review session', code: 'EINVALID' } }
+      }
+
+      const skill = candidate.channels && candidate.channels.skill
+      const candidateBody = skill && typeof skill.proposedContent === 'string'
+        ? skill.proposedContent
+        : (skill && typeof skill.currentContent === 'string' ? skill.currentContent : '')
+
+      const task = () => runReview({
+        session,
+        eff: effective(),
+        manual: true,
+        revision: { candidateId: id, instruction, candidateBody },
+      })
+      const wasRunning = running !== null
+      if (!wasRunning) {
+        task().catch((e) => ctx.logger.warn(`hermes-loop: improvement review: ${e && e.message}`))
+      } else {
+        queued.set(sourceSessionId, task)
+      }
+      trace('improve-requested', {
+        candidateId: id, sessionId: sourceSessionId, chars: instruction.length, queued: wasRunning,
+      })
+      return {
+        status: 202,
+        payload: {
+          ok: true,
+          state: wasRunning ? 'queued' : 'started',
+          candidateId: id,
+          sessionId: sourceSessionId,
+          // Say exactly what was delivered; a caller must not assume the old
+          // candidate was rewritten in place.
+          delivered: 'instruction',
+          note: 'the requirement is running as a focused review; its output becomes a new candidate, the original stays until you decide',
+        },
+      }
+    }
+
     const readActivityTail = async (limit = 60) => {
       let raw
       try { raw = await fsP.readFile(activityFile(), 'utf8') } catch { return [] }
@@ -2211,6 +2588,8 @@ module.exports = {
       } catch { /* 尚无工作区库目录 */ }
       return {
         settings: eff,
+        // Legacy field kept for existing clients; the review inbox is /pending.
+        pending: { count: await approval.count().catch(() => 0) },
         running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
         queuedCount: queued.size,
         sessions,
@@ -2255,12 +2634,33 @@ module.exports = {
                   return
                 }
                 const patch = sanitizeSettingsPatch(body.patch)
-                memoryPatch = { ...memoryPatch, ...patch }
+                let persisted = true
                 if (ctx.settings && typeof ctx.settings.update === 'function') {
                   try { await ctx.settings.update(SETTINGS_NS, patch) }
-                  catch (e) { ctx.logger.warn(`hermes-loop: settings update 失败（仅本次运行生效）: ${e && e.message}`) }
+                  catch (e) {
+                    persisted = false
+                    // The document is authoritative whenever it is writable. Only a
+                    // failed persist earns a provisional in-process override, and the
+                    // next document update replaces it — otherwise the panel would
+                    // shadow the settings document for the life of the process.
+                    memoryPatch = { ...memoryPatch, ...patch }
+                    ctx.logger.warn(`hermes-loop: settings update 失败（仅本次运行生效）: ${e && e.message}`)
+                  }
+                } else {
+                  persisted = false
+                  memoryPatch = { ...memoryPatch, ...patch }
                 }
-                sendJson(res, 200, { ok: true, settings: effective() })
+                // A successful write is authoritative: re-read the document so the
+                // response reflects it even if the update event arrives later (or the
+                // host coalesces it). A failed write keeps its provisional override.
+                if (persisted) {
+                  const d = readDescriptor()
+                  if (d && d.value && typeof d.value === 'object') {
+                    liveSettings = d.value
+                    memoryPatch = {}
+                  }
+                }
+                sendJson(res, 200, { ok: true, persisted, settings: effective() })
                 return
               }
               // 手动"立即复盘"：绕过阈值/冷却，但仍走全局串行队列与前台取消
@@ -2312,8 +2712,59 @@ module.exports = {
                 sendJson(res, 200, skill)
                 return
               }
+              // ── 待审候选：只由这里受理人工决定，模型工具面不暴露写操作 ──
+              if (apiPath.endsWith('/hermes-loop/api/pending')) {
+                if (req.method === 'GET') {
+                  const cursorRaw = url.searchParams.get('cursor')
+                  const limitRaw = url.searchParams.get('limit')
+                  sendJson(res, 200, await approval.list({
+                    sourceSession: url.searchParams.get('sourceSession') || undefined,
+                    cursor: cursorRaw === null ? undefined : Number(cursorRaw),
+                    limit: limitRaw === null ? undefined : Number(limitRaw),
+                  }))
+                  return
+                }
+                sendJson(res, 405, { error: 'method not allowed' })
+                return
+              }
+              if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/pending/detail')) {
+                sendJson(res, 200, await approval.detail(url.searchParams.get('id') || ''))
+                return
+              }
+              // 定向修订：不编辑候选，而是把用户要求送进一次聚焦复盘，
+              // 由模型产出新的待审候选；原候选保持不变，等人明确处理。
+              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/pending/improve')) {
+                const body = await readJsonBody(req)
+                const out = await requestImprovement(body)
+                sendJson(res, out.status, out.payload)
+                return
+              }
+              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/pending/decide')) {
+                const body = await readJsonBody(req)
+                sendJson(res, 200, await approval.decide(body && body.id, body))
+                return
+              }
+              if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/operations')) {
+                sendJson(res, 200, await approval.operation(url.searchParams.get('operationId') || ''))
+                return
+              }
               sendJson(res, 404, { error: 'not found' })
-            } catch (error) { sendJson(res, 400, { error: String(error && error.message || error) }) }
+            } catch (error) {
+              // Stable codes so the client can distinguish "your page is stale"
+              // from "the disk failed" without parsing prose.
+              const status = {
+                EINVALID: 400, ENOTFOUND: 404, EREVISION: 409, EOPCONFLICT: 409,
+                EAPPLIED: 409, EINPROGRESS: 409, EPATH: 400, ENOCWD: 409,
+                ECORRUPT: 422, EBUSY: 423, ETOOLARGE: 413, EBADJSON: 400,
+              }[error && error.code]
+              // The oversized request was drained, not buffered; close this
+              // connection so the unread remainder cannot be parsed as a next request.
+              if (status === 413) res.setHeader('connection', 'close')
+              sendJson(res, status || 500, {
+                error: String(error && error.message || error),
+                code: (error && error.code) || 'EERROR',
+              })
+            }
           },
         }), 'hermes-loop: client api route')
       })

@@ -1630,26 +1630,34 @@ const {
   renderReviewMemoryBlock,
 } = plugin.__internals
 
-test('workspaceSlug: cwd 折成 Claude 风格 slug；空/非法输入返回 undefined；超长截断带哈希', () => {
-  assert.equal(workspaceSlug('/Users/mac/projects/ts/dsh-plugins'), '-Users-mac-projects-ts-dsh-plugins')
-  assert.equal(workspaceSlug('C:\\code\\proj'), 'C--code-proj')
-  assert.equal(workspaceSlug('/x'), '-x')
+// The slug used to be the path with separators rewritten to '-', which is not
+// injective: '/work/a-b' and '/work/a/b' mapped onto one directory and shared a
+// MEMORY.md. It now carries a hash of the exact cwd, so the readable prefix is
+// preserved while the mapping is collision-free.
+test('workspaceSlug: 可读前缀 + cwd 哈希；空/非法输入返回 undefined；长路径不碰撞', () => {
+  assert.ok(workspaceSlug('/Users/mac/projects/ts/dsh-plugins').startsWith('-Users-mac-projects-ts-dsh-plugins-'))
+  assert.ok(workspaceSlug('C:\\code\\proj').startsWith('C--code-proj-'))
+  assert.ok(workspaceSlug('/x').startsWith('-x-'))
+  assert.match(workspaceSlug('/x'), /^-x-[0-9a-f]{12}$/, 'short path keeps its prefix and carries the hash suffix')
   assert.equal(workspaceSlug(undefined), undefined)
   assert.equal(workspaceSlug(''), undefined)
   assert.equal(workspaceSlug('   '), undefined)
   assert.equal(workspaceSlug(42), undefined)
-  // 超长路径：≤128 字符、带 8 位哈希后缀、同输入确定性
+  // 同一 cwd 恒定；分隔符与连字符不再等价（曾导致两个项目共用一个记忆库）
+  assert.equal(workspaceSlug('/work/a-b'), workspaceSlug('/work/a-b'), 'deterministic')
+  assert.notEqual(workspaceSlug('/work/a-b'), workspaceSlug('/work/a/b'), 'separator no longer collides with -')
   const longCwd = '/very/' + 'deep/'.repeat(40) + 'leaf'
   const slug = workspaceSlug(longCwd)
   assert.ok(slug.length <= 128, `slug length ${slug.length} must be ≤128`)
   assert.equal(slug, workspaceSlug(longCwd), 'deterministic')
   assert.notEqual(slug, workspaceSlug(longCwd + '2'), 'different paths must not collide on the prefix')
-  assert.match(slug, /-[0-9a-f]{8}$/, 'truncated slug carries an 8-char hash suffix')
+  assert.match(slug, /-[0-9a-f]{12}$/, 'slug carries a 12-char hash suffix')
 })
 
 test('workspaceMemoryDir 与 cwd 头注释：目录解析、slug 不可逆时的自描述回读', () => {
   const dir = workspaceMemoryDir('/Users/mac/proj')
-  assert.equal(dir, join(process.env.DSH_HOME, 'memory', 'workspaces', '-Users-mac-proj'))
+  assert.equal(dir, join(process.env.DSH_HOME, 'memory', 'workspaces', workspaceSlug('/Users/mac/proj')))
+  assert.ok(dir.startsWith(join(process.env.DSH_HOME, 'memory', 'workspaces', '-Users-mac-proj-')))
   assert.equal(workspaceMemoryDir(undefined), undefined)
   assert.equal(workspaceCwdOf(`# MEMORY\n${workspaceCwdHeader('/Users/mac/proj')}\n\n§ a\n`), '/Users/mac/proj')
   assert.equal(workspaceCwdOf('# MEMORY\n\n§ a\n'), undefined)
