@@ -1,0 +1,33 @@
+{
+  "format": 1,
+  "title": { "en": "Hermes Loop Plugin Index", "zh": "Hermes Loop 插件索引" },
+  "description": {
+    "en": "GitHub-pinned releases of Hermes Loop for DeepSeek Harness.",
+    "zh": "Hermes Loop 的 GitHub 固定提交版本：自动复盘、技能审批和跨会话记忆。"
+  },
+  "plugins": [
+    {
+      "name": "@zuelwyw/hermes-loop",
+      "title": { "en": "Hermes Loop", "zh": "Hermes Loop" },
+      "description": {
+        "en": "Background review, exact candidate previews, channel-by-channel approval, reusable skills and persistent memory.",
+        "zh": "后台复盘、按候选 ID 精确预览、分通道审批、可复用技能与跨会话记忆。"
+      },
+      "homepage": "https://github.com/zuelwyw/hermes-loop",
+      "repository": { "url": "https://github.com/zuelwyw/hermes-loop" },
+      "metadata": { "keywords": ["hermes", "loop", "skills", "memory", "approval", "复盘", "技能", "记忆", "审批"] },
+      "versions": [
+        {
+          "version": "0.4.1",
+          "publishTimestamp": 1794652885,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/zuelwyw/hermes-loop",
+            "commit": "c4162ac40bf60f0ff34f111a7786bee3d9c99978"
+          },
+          "engines": { "dsh": ">=0.1.7-rc.2" }
+        }
+      ]
+    }
+  ]
+}
