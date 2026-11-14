@@ -184,6 +184,8 @@ window.__ModuleLoader__.load({
         view: '查看',
         close: '关闭',
         'skillContent.failed': '内容加载失败',
+        'candidate.preview': '候选正文（非已安装技能）',
+        'state.unavailable': '候选不可用',
         'md.copy': '复制内容',
         'md.copied': '已复制',
         'md.code': '代码',
@@ -352,6 +354,8 @@ window.__ModuleLoader__.load({
         view: 'View',
         close: 'Close',
         'skillContent.failed': 'Failed to load content',
+        'candidate.preview': 'Proposal (not the installed skill)',
+        'state.unavailable': 'Candidate unavailable',
         'md.copy': 'Copy content',
         'md.copied': 'Copied',
         'md.code': 'Code',
@@ -463,7 +467,7 @@ window.__ModuleLoader__.load({
 
     var makeView = function (t) {
       // 技能内容弹窗（逻辑借鉴 skills-management 的 DetailModal + SkDialog）：
-      // backdrop 点击/Esc 关闭、内容区 stopPropagation；经 /api/skill 拉取正文，
+      // backdrop 点击/Esc 关闭、内容区 stopPropagation；候选按 ID 拉取 /api/candidate，正式技能按名字拉取 /api/skill，
       // MarkdownText 原语缺席时退回 pre 纯文本。
       var SkillContentDialog = function (props) {
         var _ld = React.useState(null)
@@ -476,7 +480,10 @@ window.__ModuleLoader__.load({
           var alive = true
           setData(null)
           setFailed(null)
-          fetch('/hermes-loop/api/skill?name=' + encodeURIComponent(props.name))
+          var url = props.candidateId
+            ? '/hermes-loop/api/candidate?id=' + encodeURIComponent(props.candidateId)
+            : '/hermes-loop/api/skill?name=' + encodeURIComponent(props.name)
+          fetch(url)
             .then(function (r) {
               return r.json().then(function (d) { return { ok: r.ok === true, body: d } })
             })
@@ -487,7 +494,7 @@ window.__ModuleLoader__.load({
             })
             .catch(function (e) { if (alive) setFailed(String(e && e.message || e)) })
           return function () { alive = false }
-        }, [props.name])
+        }, [props.name, props.candidateId])
         React.useEffect(function () {
           var onKey = function (e) { if (e.key === 'Escape') props.onClose() }
           try { document.addEventListener('keydown', onKey) } catch (e) { /* 无 document（测试环境） */ }
@@ -509,7 +516,8 @@ window.__ModuleLoader__.load({
           h('div', { className: 'hl-dlg', onClick: function (e) { e.stopPropagation() } },
             h('div', { className: 'hl-dlg-title' },
               h('span', null, props.name),
-              h('span', { className: 'hl-tag' }, 'SKILL.md')),
+              h('span', { className: 'hl-tag' }, props.candidateId ? t('candidate.preview') : 'SKILL.md'),
+              props.candidateId && data ? h('span', { className: 'hl-tag' }, stateText(data.state)) : null),
             failed !== null
               ? h('div', { className: 'hl-err' }, t('skillContent.failed') + ': ' + failed)
               : data === null
@@ -1177,7 +1185,12 @@ window.__ModuleLoader__.load({
         var _sv = React.useState(null)
         var viewing = _sv[0]
         var setViewing = _sv[1]
-        var openSkill = function (name) { if (name) setViewing(String(name)) }
+        var openSkill = function (name) { if (name) setViewing({ name: String(name) }) }
+        var openWritten = function (row) {
+          if (row.action === 'staged') {
+            if (row.candidateId) setViewing({ name: row.skill || row.candidateId, candidateId: row.candidateId })
+          } else if (row.result === 'created' || row.result === 'patched') openSkill(row.skill)
+        }
 
         React.useEffect(function () {
           var alive = true
@@ -1389,11 +1402,13 @@ window.__ModuleLoader__.load({
               rows.length > 0
                 ? h('ul', { className: 'hl-list' }, rows.map(function (w, i) {
                   return h('li', { key: i },
-                    h('span', { className: 'hl-tag' }, t('action.' + (w.action || 'create'))),
+                    h('span', { className: 'hl-tag' }, w.action === 'staged' ? stateText(w.candidateState || 'unavailable') : t('action.' + (w.action || 'create'))),
                     h('span', { className: 'hl-skill' }, w.skill),
-                    h('button', { className: 'hl-view', title: t('view'), onClick: function () { openSkill(w.skill) } }, t('view')),
+                    h('button', { className: 'hl-view', title: t('view'),
+                      disabled: w.action === 'staged' ? !w.candidateId || w.candidateState === 'unavailable' : w.result !== 'created' && w.result !== 'patched',
+                      onClick: function () { openWritten(w) } }, t('view')),
                     h('span', { className: 'hl-mut' }, fmtDate(w.at)),
-                    w.result && w.result !== 'created' && w.result !== 'patched'
+                    w.result && w.result !== 'created' && w.result !== 'patched' && w.action !== 'staged'
                       ? h('span', { className: 'hl-err hl-mut' }, w.result) : null,
                     w.path ? h('span', { className: 'hl-path' }, w.path) : null)
                 }))
@@ -1534,7 +1549,7 @@ window.__ModuleLoader__.load({
 
           // 技能内容弹窗（三处「查看」按钮共用）
           viewing !== null
-            ? h(SkillContentDialog, { name: viewing, onClose: function () { setViewing(null) } })
+            ? h(SkillContentDialog, { name: viewing.name, candidateId: viewing.candidateId, onClose: function () { setViewing(null) } })
             : null,
         )
       }

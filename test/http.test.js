@@ -109,12 +109,64 @@ const candidate = (id, extra = {}) => ({
   ...extra,
 })
 
+test('staged rows preview the exact candidate, never the installed namesake', async (t) => {
+  const { call, stage, home } = await mount(t)
+  await stage('preview-a', candidate('preview-a'))
+  await stage('preview-b', candidate('preview-b', {
+    conclusion: { action: 'create', skill: 'http-skill', description: 'Second', body: '# Second candidate' },
+  }))
+  await fsp.writeFile(join(home, 'hermes-loop', 'activity.jsonl'), [
+    { event: 'staged', id: 'preview-a', skill: 'http-skill', sessionId: 'session-http' },
+    { event: 'staged', id: 'preview-b', skill: 'http-skill', sessionId: 'session-http' },
+  ].map(JSON.stringify).join('\n') + '\n')
+  const status = await call('GET', '/status?sessionId=session-http')
+  assert.equal(status.body.written[0].candidateId, 'preview-b')
+  assert.equal(status.body.written[0].candidateState, 'pending')
+  assert.equal((await call('GET', '/skill?name=http-skill')).status, 404)
+  const before = await fsp.readdir(join(home, 'hermes-loop', 'pending'))
+  const a = await call('GET', '/candidate?id=preview-a')
+  assert.equal(a.status, 200)
+  assert.equal(a.body.content, '# HTTP\n\nBody.')
+  assert.equal(a.body.state, 'pending')
+  assert.equal((await call('GET', '/candidate?id=preview-b')).body.content, '# Second candidate')
+  await fsp.mkdir(join(home, 'skills', 'http-skill'), { recursive: true })
+  await fsp.writeFile(join(home, 'skills', 'http-skill', 'SKILL.md'), '---\nname: http-skill\ndescription: installed\n---\nInstalled body')
+  assert.match((await call('GET', '/skill?name=http-skill')).body.content, /Installed body/)
+  assert.equal((await call('GET', '/candidate?id=preview-a')).body.content, a.body.content)
+  assert.deepEqual(await fsp.readdir(join(home, 'hermes-loop', 'pending')), before)
+})
+
+test('candidate preview survives approval or rejection and ledger state is current', async (t) => {
+  const { call, stage, home } = await mount(t)
+  await stage('preview-done', candidate('preview-done'))
+  await fsp.writeFile(join(home, 'hermes-loop', 'activity.jsonl'), JSON.stringify({ event: 'staged', id: 'preview-done', skill: 'http-skill' }) + '\n')
+  const detail = await call('GET', '/pending/detail?id=preview-done')
+  const applied = await call('POST', '/pending/decide', {
+    id: 'preview-done', expectedRevision: detail.body.revision, operationId: 'op-preview0001', skill: 'apply',
+  })
+  assert.equal(applied.body.status, 'applied')
+  const archived = await call('GET', '/candidate?id=preview-done')
+  assert.equal(archived.status, 200)
+  assert.equal(archived.body.state, 'applied')
+  assert.equal(archived.body.content, '# HTTP\n\nBody.')
+  assert.equal((await call('GET', '/status')).body.written.find(w => w.candidateId === 'preview-done').candidateState, 'applied')
+  await stage('preview-rejected', candidate('preview-rejected'))
+  const rejected = await call('POST', '/pending/decide', {
+    id: 'preview-rejected', expectedRevision: 1, operationId: 'op-preview0002', skill: 'reject',
+  })
+  assert.equal(rejected.body.status, 'rejected')
+  assert.equal((await call('GET', '/candidate?id=preview-rejected')).body.state, 'rejected')
+  assert.equal((await call('GET', '/candidate?id=..%2Fsecret')).status, 400)
+  assert.equal((await call('GET', '/candidate?id=missing')).status, 404)
+})
+
 test('the trust fence answers before any route logic', async (t) => {
   const { call, stage } = await mount(t, { rejection: 401 })
   await stage('h1', candidate('h1'))
   const res = await call('GET', '/pending')
   assert.equal(res.status, 401)
   assert.equal(res.body, undefined, 'a rejected request must be empty, not a JSON body')
+  assert.equal((await call('GET', '/candidate?id=h1')).status, 401)
 })
 
 test('list, detail and decide work over HTTP and write once', async (t) => {

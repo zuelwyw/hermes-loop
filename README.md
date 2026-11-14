@@ -1,10 +1,9 @@
 # @zuelwyw/hermes-loop
 
 [![DSH plugin](https://img.shields.io/badge/dsh-plugin-green)](https://github.com/topics/dsh-plugin)
-[![GitHub fork](https://img.shields.io/badge/fork-zuelwyw%2Fhermes--loop-green)](https://github.com/zuelwyw/hermes-loop)
+[![GitHub](https://img.shields.io/badge/GitHub-zuelwyw%2Fhermes--loop-green)](https://github.com/zuelwyw/hermes-loop)
 
-> 本仓库是 [weibaohui/hermes-loop](https://github.com/weibaohui/hermes-loop) 的 fork，包名改为 `@zuelwyw/hermes-loop`。
-> 运行时标识刻意保持不变：数据目录 `~/.dsh/hermes-loop/`、设置命名空间 `hermes-loop`、HTTP 路由 `/hermes-loop/api`，因此升级不影响既有待审候选与已保存设置。
+> 运行时标识保持不变：数据目录 `~/.dsh/hermes-loop/`、设置命名空间 `hermes-loop`、HTTP 路由 `/hermes-loop/api`，因此升级不影响既有待审候选与已保存设置。
 
 **自动复盘插件**：对话收尾后自动复盘，把有价值的经验蒸馏成可复用的技能（skill），把值得长期记住的事实与偏好写入跨会话记忆。
 
@@ -21,13 +20,21 @@
 - **跨会话记忆**：复盘按需把环境/项目事实、约定教训写入 `~/.dsh/memory/MEMORY.md`，把用户画像与偏好写入 `USER.md`（对齐 Hermes 的记忆分层）；记忆全文以会话首冻结方式注入每个对话，写入或手改后下个会话生效。按需产出——多数复盘不产生记忆，不为写而写
 - **工作区记忆**（v0.6，参考 Claude Code 的 per-project 记忆）：复盘自动判断归属——只适用当前项目的事实（端口、路径、项目特有约定）写入 `~/.dsh/memory/workspaces/<工作区>/MEMORY.md`，跨项目通用约定进全局库，用户画像恒全局；两层拼接注入，每层独立 2200 字符配额。无开关，常开
 
-## 安装
+## 安装与更新（GitHub 索引）
 
-```bash
-dsh plugin --profile web add @zuelwyw/hermes-loop -w
+在 DSH「插件 → 发现 → 索引源」添加：
+
+```text
+https://raw.githubusercontent.com/zuelwyw/hermes-loop/main/index.json
 ```
 
-装完重启 `dsh web` 即生效。
+索引只列出本仓库的 Hermes-Loop，不替换其他索引源。在「发现」中打开 Hermes Loop，选择版本安装。每个版本使用完整 Git 提交 SHA，安装内容不会随分支或标签移动而变化。
+
+**更新**：刷新索引后，通过插件管理器检查并安装新版本。后续发布需要把新版本及其完整提交 SHA 追加到索引；仅创建 Release 不会自动更新索引。Git 更新要求已安装副本来自同一 Git 仓库目录。
+
+已经使用本地 `file:` 压缩包安装的副本，需要通过宿主支持的卸载/安装流程切回索引提供的 Git 来源；只添加索引 URL 不会自动改变已安装副本的来源。先备份 profile 配置，保留 `~/.dsh/hermes-loop/` 下的候选与审批记录，不手工覆盖 profile 或 node_modules。
+
+安装结果以宿主回执为准：`applied` 表示宿主已应用，`restart-required` 表示仅保存、等待重启。Host 与浏览器端生效需分别核验，不把旧界面当作新版证据。本仓库只发布 GitHub Release，不自动发布 npm。
 
 ## 使用
 
@@ -35,22 +42,18 @@ dsh plugin --profile web add @zuelwyw/hermes-loop -w
 2. 默认自动模式即可工作；想更稳妥可切换为「审批」模式（复盘写入前需你确认）
 3. 触发阈值、冷却时间、纠正词表均可在面板调整
 4. 复盘产出的技能进入技能库后，模型通过 `skill` 工具直接使用；使用统计与归档管理也在面板里
-5. 沉淀记录、使用统计与 Curator 表里的技能名后都有「查看」按钮，弹窗直接看 SKILL.md 内容（Markdown 渲染；项目级技能也能看）
+5. 沉淀记录中的「查看」按候选 ID 展示候选正文及当前审批状态，审批归档后仍能查看原提案；候选不等于已安装技能。已写入记录、使用统计与 Curator 表的「查看」读取正式技能正文（Markdown 渲染；项目级技能也能看）。候选记录缺失时显示不可用，不用同名正式技能冒充候选。
 6. 记忆条目在面板查看用量与内容；增删改直接编辑 `~/.dsh/memory/MEMORY.md` / `USER.md`（全局层）或 `~/.dsh/memory/workspaces/<工作区>/MEMORY.md`（工作区层），一行一条、`§ ` 开头，下个会话生效
 
 ## 审批模式：候选来源与「提出修改要求」
 
 `mode: approval` 下，复盘结论暂存到 `~/.dsh/hermes-loop/pending/`，在面板的「待审批」卡片里逐条处理。
 
-- **审批面只做查看与通过/拒绝**，不提供候选正文编辑——与 Hermes 官方一致：改内容由模型做，人只做取舍。
+- **审批面只做查看与通过/拒绝**，不提供候选正文编辑：修改要求交给模型生成新候选，人决定是否采用。
 - **通过/拒绝按通道独立**：技能与记忆分开结算，混合候选可以只处理一半，其余保持待审。
 - **幂等**：`operationId` 绑定决定指纹，重复提交返回既有结果；写盘前落哈希意图，崩溃后按哈希核对而不是盲目重放。
 - **「提出修改要求」**：输入要求后启动一次聚焦复盘，要求作为 prompt 文本进入模型；产出的**新**候选带 `revisionOf` 指回原候选，原候选保持待审直到你明确处理。要求需要来源会话在本进程内仍存活，否则如实报 `ESESSIONGONE`，不会假装已送达。
 - **来源显示**：只有暂存时确实记下的来源才显示；curator 产生的候选标「来源未知」，不用同名技能的历史记录去推断。
-
-## 联系我 :飞书群
-
-![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
 
 ## 版本兼容性
 
@@ -58,6 +61,7 @@ dsh plugin --profile web add @zuelwyw/hermes-loop -w
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.1 | 0.2.2-rc.3 | 待审技能按候选 ID 预览，支持审批后归档预览及当前状态展示；移除联系推广与额外来源声明；测试命令覆盖审批与 HTTP 回归测试 |
 | 0.4.0 | 0.2.2-rc.3 | 本分支：审批收件箱（分通道结算 / 幂等 / 崩溃核对）、定向复盘式「提出修改要求」；修复工作区 slug 碰撞、设置覆盖层永久遮蔽、归档恢复假成功、转写限额两个死开关；包版本号此前未随 0.3.x 递增，本版对齐至 0.4.0 |
 | 0.1.17 | 0.2.0-rc.2 | 复盘 prompt / 记忆快照 / 收尾沉淀段跟随 DSH 语言设置（`locale.preference`），不重启切换即生效；e2e 测试清理竞态修复 |
 | 0.1.16 | 0.1.7-rc.2 | 修复降级路径 Config 导出 null——宿主 settings schema() 不排除 null，会炸 settings.describe() 拖垮整份设置文档（同 dsh-continue#4） |

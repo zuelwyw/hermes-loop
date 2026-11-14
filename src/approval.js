@@ -416,6 +416,30 @@ function createApproval(deps) {
     return all.length
   }
 
+  // Read-only historical preview. Identity is the candidate ID, not a skill
+  // name: multiple proposals (and the installed version) may share that name.
+  // This must not call preflight/ensureRecord or make an archived item writable.
+  async function preview(id) {
+    if (!isSafeId(id)) { const e = new Error('invalid candidate id'); e.code = 'EINVALID'; throw e }
+    for (const dir of [pendingDir(), doneDir(), rejectedDir()]) {
+      const payload = await readJson(insideRoot(dir, join(dir, `${id}.json`)))
+      if (payload === undefined) continue
+      const c = payload.conclusion || {}
+      const record = dir === pendingDir()
+        ? await loadRecord(id)
+        : await readJson(insideRoot(dir, join(dir, `${id}.record.json`)))
+      const state = record && record.channels && record.channels.skill
+        ? record.channels.skill.state
+        : (record && record.verdict) || 'pending'
+      return {
+        id, name: c.skill, description: c.description || c.baseDescription || '',
+        content: typeof c.body === 'string' ? c.body : '',
+        state, archived: dir !== pendingDir(),
+      }
+    }
+    const e = new Error(`candidate '${id}' not found`); e.code = 'ENOTFOUND'; throw e
+  }
+
   // ── Detail ─────────────────────────────────────────────────────────────
   async function detail(id) {
     if (!isSafeId(id)) { const e = new Error('invalid candidate id'); e.code = 'EINVALID'; throw e }
@@ -844,7 +868,7 @@ function createApproval(deps) {
     return { checked }
   }
 
-  return { list, detail, decide, operation, recover, count, withLock, isSafeId }
+  return { list, detail, preview, decide, operation, recover, count, withLock, isSafeId }
 }
 
 module.exports = { createApproval, withLock, isSafeId, PENDING_ID_RE, OPERATION_ID_RE, SETTLED }

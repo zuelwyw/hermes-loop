@@ -2440,10 +2440,17 @@ module.exports = {
           action: e.event === 'staged' ? 'staged' : (e.action === 'patched' ? 'patch' : 'create'),
           skill: e.skill,
           result: e.event === 'staged' ? 'staged' : e.result,
+          candidateId: e.event === 'staged' ? e.id : undefined,
           path: e.path,
           sessionId: e.sessionId || dispatchSessionBySkill.get(e.skill),
         }))
         .reverse()
+      // The ledger is immutable history; show the current channel state without
+      // guessing identity from a same-named skill or rewriting past events.
+      await Promise.all(written.filter((w) => w.action === 'staged').map(async (w) => {
+        try { w.candidateState = (await approval.preview(w.candidateId)).state }
+        catch { w.candidateState = 'unavailable' }
+      }))
       // 把碎片事件聚成"每次复盘一行"：review-start 开一个聚类，后续事件补全它的结果
       const reviews = []
       let currentReview = null
@@ -2710,6 +2717,11 @@ module.exports = {
                 const skill = await readSkillForPanel(name)
                 if (skill === undefined) { sendJson(res, 404, { error: `skill '${name}' not found` }); return }
                 sendJson(res, 200, skill)
+                return
+              }
+              // Read-only exact proposal preview, including settled archives.
+              if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/candidate')) {
+                sendJson(res, 200, await approval.preview(url.searchParams.get('id') || ''))
                 return
               }
               // ── 待审候选：只由这里受理人工决定，模型工具面不暴露写操作 ──
